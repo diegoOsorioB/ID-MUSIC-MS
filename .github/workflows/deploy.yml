@@ -1,4 +1,4 @@
-name: Deploy Proyectos Monorepo - Producción
+name: Deploy Proyectos Monorepo
 
 on:
   push:
@@ -8,17 +8,21 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      CHANGED_PROJECTS: ""
+      
     steps:
+      # 1️⃣ Obtener código
       - uses: actions/checkout@v3
 
-      # Detectar proyectos modificados
+      # 2️⃣ Detectar proyectos modificados
       - name: Detectar proyectos modificados
         id: cambios
         run: |
           echo "CHANGED_PROJECTS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | awk -F/ '{print $1}' | sort -u)" >> $GITHUB_ENV
           echo "Proyectos cambiados: $CHANGED_PROJECTS"
 
-      # Construir los proyectos modificados
+      # 3️⃣ Construir los proyectos modificados
       - name: Build JARs
         run: |
           for proj in $CHANGED_PROJECTS; do
@@ -29,8 +33,17 @@ jobs:
             fi
           done
 
-      # Deploy y reinicio con rollback
-      - name: Deploy, reinicio y rollback
+      # 4️⃣ Test de conexión SSH
+      - name: Test SSH connection
+        uses: appleboy/ssh-action@v0.1.6
+        with:
+          host: ${{ secrets.EC2_DNS }}
+          username: ec2-user
+          key: ${{ secrets.EC2_KEY }}
+          script: "echo Conexión SSH exitosa desde GitHub Actions"
+
+      # 5️⃣ Deploy, backup y rollback
+      - name: Deploy proyectos
         uses: appleboy/ssh-action@v0.1.6
         with:
           host: ${{ secrets.EC2_DNS }}
@@ -40,7 +53,7 @@ jobs:
             for proj in $CHANGED_PROJECTS; do
               mkdir -p /home/ec2-user/$proj
               mkdir -p /home/ec2-user/$proj/backup
-            
+
               # Backup del JAR actual
               if [ -f /home/ec2-user/$proj/*.jar ]; then
                 mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
@@ -53,14 +66,13 @@ jobs:
               # Detener app anterior
               pkill -f "$proj" || true
 
-              # Intentar lanzar el nuevo JAR
+              # Lanzar nuevo JAR
               nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
               sleep 10
 
-              # Verificar si la app sigue corriendo, si falla hacer rollback
+              # Verificar si está corriendo, rollback si falla
               if ! pgrep -f "$proj"; then
                 echo "ERROR: $proj falló al iniciar, haciendo rollback..."
-                # Restaurar último JAR estable
                 if [ -f /home/ec2-user/$proj/backup/*.jar ]; then
                   mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
                   nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
@@ -68,8 +80,8 @@ jobs:
               fi
             done
 
-      # Notificación si algo falla
-      - name: Notificar fallo
+      # 6️⃣ Notificación de fallo en Slack
+      - name: Notificar fallo en Slack
         if: failure()
         uses: rtCamp/action-slack-notify@v2
         with:
