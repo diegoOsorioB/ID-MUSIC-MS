@@ -1,13 +1,15 @@
+
 name: Deploy Proyectos Monorepo
+name: Test Conectividad EC2
+
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:  # Permite ejecutar manualmente desde GitHub
 
 jobs:
-  build-and-deploy:
+  connectivity-test:
     runs-on: ubuntu-latest
+
 
     steps:
       - name: Checkout repo
@@ -15,9 +17,15 @@ jobs:
 
       - name: Detectar proyectos modificados
         id: cambios
+
+
+    steps:
+      - name: Test ping a EC2
+
         run: |
-          echo "CHANGED_PROJECTS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | awk -F/ '{print $1}' | sort -u)" >> $GITHUB_ENV
-          echo "Proyectos cambiados: $CHANGED_PROJECTS"
+          echo "Probando conectividad ICMP (ping) a la instancia EC2..."
+          ping -c 4 ${{ secrets.EC2_DNS }} || echo "Ping falló"
+
 
       - name: Build y deploy por proyecto
         uses: appleboy/ssh-action@v0.1.6
@@ -69,4 +77,15 @@ jobs:
         with:
           webhook_url: ${{ secrets.SLACK_WEBHOOK }}
           message: "Deploy finalizado con éxito en EC2: ${{ github.repository }}"
+
+
+      - name: Test puerto SSH (22)
+        run: |
+          echo "Probando puerto SSH 22 con nc..."
+          nc -vz -w 5 ${{ secrets.EC2_DNS }} 22 || echo "Conexión al puerto 22 falló"
+
+      - name: Test puertos de la aplicación (8081)
+        run: |
+          echo "Probando puerto 8081 de la app..."
+          nc -vz -w 5 ${{ secrets.EC2_DNS }} 8081 || echo "Conexión al puerto 8081 falló"
 
