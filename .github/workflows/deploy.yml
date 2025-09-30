@@ -10,63 +10,68 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v3
 
-    - name: Detectar proyectos modificados
-      id: cambios
-      run: |
-        echo "CHANGED_PROJECTS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | awk -F/ '{print $1}' | sort -u)" >> $GITHUB_ENV
-        echo "Proyectos cambiados: $CHANGED_PROJECTS"
+      - name: Detectar proyectos modificados
+        id: changes
+        run: |
+          echo "CHANGED_PROJECTS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | awk -F/ '{print $1}' | sort -u)" >> $GITHUB_ENV
+          echo "Proyectos cambiados: $CHANGED_PROJECTS"
 
-    - name: Build y deploy por proyecto
-      uses: appleboy/ssh-action@v0.1.6
-      with:
-        host: ${{ secrets.EC2_DNS }}
-        username: ec2-user
-        key: ${{ secrets.EC2_KEY }}
-        port: 22
-        script: |
-          for proj in $CHANGED_PROJECTS; do
-            echo "=== Desplegando $proj ==="
+      - name: Build y deploy por proyecto
+        uses: appleboy/ssh-action@v0.1.6
+        with:
+          host: ${{ secrets.EC2_DNS }}
+          username: ec2-user
+          key: ${{ secrets.EC2_KEY }}
+          port: 22
+          script: |
+            for proj in $CHANGED_PROJECTS; do
+              echo "=== Desplegando $proj ==="
+              mkdir -p /home/ec2-user/$proj
+              mkdir -p /home/ec2-user/$proj/backup
 
-            # Crear carpetas si no existen
-            mkdir -p /home/ec2-user/$proj
-            mkdir -p /home/ec2-user/$proj/backup
-
-            # Backup del JAR actual
-            if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
-              mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
-            fi
-
-            # Subir nuevo JAR
-            if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
-              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
-            elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
-              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
-            fi
-
-            # Detener app anterior
-            pkill -f "$proj" || true
-
-            # Intentar lanzar el nuevo JAR
-            nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
-            sleep 10
-
-            # Verificar si la app escucha en 8081
-            if ! ss -tuln | grep -q ':8081'; then
-              echo "ERROR: $proj no arrancó en 8081, haciendo rollback..."
-              if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
-                mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
-                nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
+              # Backup del JAR actual
+              if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
+                mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
               fi
-            fi
-          done
 
-    - name: Notificar Slack (opcional)
-      if: success() && secrets.SLACK_WEBHOOK
-      uses: rtCamp/action-slack-notify@v2
-      with:
-        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
-        message: "Deploy finalizado con éxito en EC2: ${{ github.repository }}"
+              # Subir nuevo JAR
+              if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
+                scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
+              elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
+                scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
+              fi
 
+              # Detener app anterior
+              pkill -f "$proj" || true
+
+              # Lanzar nuevo JAR
+              nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
+              sleep 10
+
+              # Verificar puertos 8080-8086
+              PORT_OK=false
+              for port in {8080..8086}; do
+                if ss -tuln | grep -q ":$port"; then
+                  PORT_OK=true
+                  break
+                fi
+              done
+
+              if [ "$PORT_OK" = false ]; then
+                echo "ERROR: $proj no arrancó en puertos 8080-8086, haciendo rollback..."
+                if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
+                  mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
+                  nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
+                fi
+              fi
+            done
+
+      - name: Notificar Slack (opcional)
+        if: success() && env.SLACK_WEBHOOK
+        uses: rtCamp/action-slack-notify@v2
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          message: "Deploy finalizado con éxito en EC2: ${{ github.repository }}"
