@@ -10,9 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CHANGED_PROJECTS: ""
-      
+
     steps:
-      # 1️⃣ Obtener código
+      # 1️⃣ Obtener el código
       - uses: actions/checkout@v3
 
       # 2️⃣ Detectar proyectos modificados
@@ -81,9 +81,9 @@ jobs:
             done
 
       # 6️⃣ Notificación de fallo en Slack
-      - name: Notificar fallo en Slack
-        if: failure()
-        uses: rtCamp/action-slack-notify@v2
-        with:
-          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
-          message: "⚠️ Despliegue fallido en proyecto(s) modificados: $CHANGED_PROJECTS"
+    #  - name: Notificar fallo en Slack
+     #   if: failure()
+      #  uses: rtCamp/action-slack-notify@v2
+      #  with:
+      #    webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+       #   message: "⚠️ Despliegue fallido en proyecto(s) modificados: $CHANGED_PROJECTS"
