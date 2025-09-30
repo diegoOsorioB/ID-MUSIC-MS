@@ -1,4 +1,7 @@
+
+name: Deploy Proyectos Monorepo
 name: Test Conectividad EC2
+
 
 on:
   workflow_dispatch:  # Permite ejecutar manualmente desde GitHub
@@ -7,11 +10,74 @@ jobs:
   connectivity-test:
     runs-on: ubuntu-latest
 
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Detectar proyectos modificados
+        id: cambios
+
+
     steps:
       - name: Test ping a EC2
+
         run: |
           echo "Probando conectividad ICMP (ping) a la instancia EC2..."
           ping -c 4 ${{ secrets.EC2_DNS }} || echo "Ping falló"
+
+
+      - name: Build y deploy por proyecto
+        uses: appleboy/ssh-action@v0.1.6
+        with:
+          host: ${{ secrets.EC2_DNS }}
+          username: ec2-user
+          key: ${{ secrets.EC2_KEY }}
+          port: 22
+          script: |
+            for proj in $CHANGED_PROJECTS; do
+              echo "=== Desplegando $proj ==="
+            
+              # Crear carpetas si no existen
+              mkdir -p /home/ec2-user/$proj
+              mkdir -p /home/ec2-user/$proj/backup
+            
+              # Backup del JAR actual
+              if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
+                mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
+              fi
+            
+              # Subir nuevo JAR
+              if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
+                scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
+              elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
+                scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
+              fi
+            
+              # Detener app anterior
+              pkill -f "$proj" || true
+            
+              # Intentar lanzar el nuevo JAR
+              nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
+              sleep 10
+            
+              # Verificar si la app escucha en 8081
+              if ! ss -tuln | grep -q ':8081'; then
+                echo "ERROR: $proj no arrancó en 8081, haciendo rollback..."
+                if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
+                  mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
+                  nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
+                fi
+              fi
+            done
+
+      - name: Notificar Slack (opcional)
+        if: success() && secrets.SLACK_WEBHOOK
+        uses: rtCamp/action-slack-notify@v2
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          message: "Deploy finalizado con éxito en EC2: ${{ github.repository }}"
+
 
       - name: Test puerto SSH (22)
         run: |
@@ -22,3 +88,4 @@ jobs:
         run: |
           echo "Probando puerto 8081 de la app..."
           nc -vz -w 5 ${{ secrets.EC2_DNS }} 8081 || echo "Conexión al puerto 8081 falló"
+
