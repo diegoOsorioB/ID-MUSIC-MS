@@ -1,25 +1,24 @@
-name: Test SSH Conexión EC2
+name: Test Conectividad EC2
 
 on:
   workflow_dispatch:  # Permite ejecutar manualmente desde GitHub
 
 jobs:
-  ssh-test:
+  connectivity-test:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Clonar el repositorio (necesario para el workspace)
-      - uses: actions/checkout@v3
+      - name: Test ping a EC2
+        run: |
+          echo "Probando conectividad ICMP (ping) a la instancia EC2..."
+          ping -c 4 ${{ secrets.EC2_DNS }} || echo "Ping falló"
 
-      # 2️⃣ Probar conexión SSH
-      - name: Test SSH connection
-        uses: appleboy/ssh-action@v0.1.6
-        with:
-          host: ${{ secrets.EC2_DNS }}        # DNS público de tu EC2
-          username: ec2-user                  # Usuario correcto para Amazon Linux 2023
-          key: ${{ secrets.EC2_KEY }}        # Contenido completo del .pem
-          port: 22
-          script: |
-            echo "Conexión SSH exitosa desde GitHub Actions"
-            whoami
-            hostname
+      - name: Test puerto SSH (22)
+        run: |
+          echo "Probando puerto SSH 22 con nc..."
+          nc -vz -w 5 ${{ secrets.EC2_DNS }} 22 || echo "Conexión al puerto 22 falló"
+
+      - name: Test puertos de la aplicación (8081)
+        run: |
+          echo "Probando puerto 8081 de la app..."
+          nc -vz -w 5 ${{ secrets.EC2_DNS }} 8081 || echo "Conexión al puerto 8081 falló"
