@@ -1,89 +1,25 @@
-name: Deploy Proyectos Monorepo
+name: Test SSH Conexión EC2
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:  # Permite ejecutar manualmente desde GitHub
 
 jobs:
-  build-and-deploy:
+  ssh-test:
     runs-on: ubuntu-latest
-    env:
-      CHANGED_PROJECTS: ""
 
     steps:
-      # 1️⃣ Obtener el código
+      # 1️⃣ Clonar el repositorio (necesario para el workspace)
       - uses: actions/checkout@v3
 
-      # 2️⃣ Detectar proyectos modificados
-      - name: Detectar proyectos modificados
-        id: cambios
-        run: |
-          echo "CHANGED_PROJECTS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | awk -F/ '{print $1}' | sort -u)" >> $GITHUB_ENV
-          echo "Proyectos cambiados: $CHANGED_PROJECTS"
-
-      # 3️⃣ Construir los proyectos modificados
-      - name: Build JARs
-        run: |
-          for proj in $CHANGED_PROJECTS; do
-            if [ -f "$proj/pom.xml" ]; then
-              mvn -f $proj/pom.xml clean package -DskipTests
-            elif [ -f "$proj/build.gradle" ]; then
-              ./gradlew $proj:build -x test
-            fi
-          done
-
-      # 4️⃣ Test de conexión SSH
+      # 2️⃣ Probar conexión SSH
       - name: Test SSH connection
         uses: appleboy/ssh-action@v0.1.6
         with:
-          host: ${{ secrets.EC2_DNS }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: "echo Conexión SSH exitosa desde GitHub Actions"
-
-      # 5️⃣ Deploy, backup y rollback
-      - name: Deploy proyectos
-        uses: appleboy/ssh-action@v0.1.6
-        with:
-          host: ${{ secrets.EC2_DNS }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
+          host: ${{ secrets.EC2_DNS }}        # DNS público de tu EC2
+          username: ec2-user                  # Usuario correcto para Amazon Linux 2023
+          key: ${{ secrets.EC2_KEY }}        # Contenido completo del .pem
+          port: 22
           script: |
-            for proj in $CHANGED_PROJECTS; do
-              mkdir -p /home/ec2-user/$proj
-              mkdir -p /home/ec2-user/$proj/backup
-
-              # Backup del JAR actual
-              if [ -f /home/ec2-user/$proj/*.jar ]; then
-                mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
-              fi
-
-              # Subir nuevo JAR
-              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/ || \
-              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
-
-              # Detener app anterior
-              pkill -f "$proj" || true
-
-              # Lanzar nuevo JAR
-              nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
-              sleep 10
-
-              # Verificar si está corriendo, rollback si falla
-              if ! pgrep -f "$proj"; then
-                echo "ERROR: $proj falló al iniciar, haciendo rollback..."
-                if [ -f /home/ec2-user/$proj/backup/*.jar ]; then
-                  mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
-                  nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
-                fi
-              fi
-            done
-
-      # 6️⃣ Notificación de fallo en Slack
-    #  - name: Notificar fallo en Slack
-     #   if: failure()
-      #  uses: rtCamp/action-slack-notify@v2
-      #  with:
-      #    webhook_url: ${{ secrets.SLACK_WEBHOOK }}
-       #   message: "⚠️ Despliegue fallido en proyecto(s) modificados: $CHANGED_PROJECTS"
+            echo "Conexión SSH exitosa desde GitHub Actions"
+            whoami
+            hostname
