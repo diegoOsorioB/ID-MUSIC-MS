@@ -1,4 +1,4 @@
-name: Despliegue a EC2
+name: Deploy JAR to EC2
 
 on:
   push:
@@ -8,40 +8,78 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
-    env:
-      CHANGED_PROJECTS: "tu_proyecto"
+   env:
+  CHANGED_PROJECTS: "Clientes Inventarios modulo-jwt paquetes Servicios"
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Configurar llave SSH
-      run: |
-        mkdir -p ~/.ssh
-        echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
-        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
-        chmod 644 ~/.ssh/known_hosts
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
 
-    - name: Test conexión SSH
-      run: ssh -i ~/.ssh/id_rsa ec2-user@${{ secrets.EC2_HOST }} -p 22 "echo Conexión exitosa"
+      - name: Build project
+        run: |
+          cd $CHANGED_PROJECTS
+          if [ -f "pom.xml" ]; then
+            mvn clean package -DskipTests
+          elif [ -f "build.gradle" ]; then
+            ./gradlew build -x test
+          fi
 
-    - name: Desplegar proyecto
-      run: |
-        for proj in $CHANGED_PROJECTS; do
-          echo "=== Desplegando $proj ==="
-          ssh -i ~/.ssh/id_rsa ec2-user@${{ secrets.EC2_HOST }} -p 22 "
-            mkdir -p /home/ec2-user/$proj
-            mkdir -p /home/ec2-user/$proj/backup
+      - name: Deploy to EC2
+        run: |
+          ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_HOST }} 'bash -s' <<'EOF'
+          for proj in $CHANGED_PROJECTS; do
+            echo "=== Desplegando $proj ==="
+            mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup
+
+            # Backup del JAR actual
             if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
               mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
             fi
-          "
-          scp -i ~/.ssh/id_rsa -P 22 $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/$proj/
-          ssh -i ~/.ssh/id_rsa ec2-user@${{ secrets.EC2_HOST }} -p 22 "
-            pkill -f '$proj' || true
+          done
+          EOF
+
+          # Subir JAR a EC2
+          for proj in $CHANGED_PROJECTS; do
+            if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
+              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/$proj/
+            elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
+              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/$proj/
+            fi
+          done
+
+          # Ejecutar despliegue en EC2
+          ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_HOST }} 'bash -s' <<'EOF'
+          for proj in $CHANGED_PROJECTS; do
+            # Detener app anterior
+            pkill -f "$proj" || true
+
+            # Lanzar nuevo JAR
             nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
             sleep 10
-          "
-        done
+
+            # Verificar puertos 8080-8086
+            PORT_OK=false
+            for port in {8080..8086}; do
+              if ss -tuln | grep -q ":$port"; then
+                PORT_OK=true
+                break
+              fi
+            done
+
+            if [ "$PORT_OK" = false ]; then
+              echo "ERROR: $proj no arrancó, rollback..."
+              if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
+                mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
+                nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
+              fi
+            fi
+          done
+          EOF
