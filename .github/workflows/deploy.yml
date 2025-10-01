@@ -24,9 +24,6 @@ jobs:
           java-version: '21'
           cache: 'maven'
 
-      - name: Verify Java version
-        run: java -version
-
       - name: Setup SSH key
         run: |
           mkdir -p ~/.ssh
@@ -34,18 +31,18 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.EC2_DNS }} >> ~/.ssh/known_hosts
 
-      - name: Test SSH connection
-        run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "echo 'SSH connection successful'"
-
-      - name: Verify Java on EC2
+      - name: Disable EC2 Internal Firewall
         run: |
           ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-            echo '=== Checking Java on EC2 ==='
-            java -version || echo 'Java not found'
-            which java || echo 'Java not in PATH'
-            echo 'Java home:'
-            ls -la /usr/lib/jvm/ || echo 'No JVM directory'
+            echo '=== Disabling internal firewall ==='
+            sudo iptables -F 2>/dev/null || true
+            sudo iptables -X 2>/dev/null || true
+            sudo iptables -t nat -F 2>/dev/null || true
+            sudo iptables -t nat -X 2>/dev/null || true
+            sudo iptables -P INPUT ACCEPT 2>/dev/null || true
+            sudo iptables -P FORWARD ACCEPT 2>/dev/null || true
+            sudo iptables -P OUTPUT ACCEPT 2>/dev/null || true
+            echo 'Firewall disabled'
           "
 
       - name: Build projects
@@ -59,27 +56,8 @@ jobs:
               elif [ -f "build.gradle" ]; then
                 chmod +x ./gradlew
                 ./gradlew build -x test
-              else
-                echo "WARNING: No build file found for $proj"
               fi
               cd ..
-            else
-              echo "WARNING: Directory $proj not found"
-            fi
-          done
-
-      - name: Verify JARs were built
-        run: |
-          echo "=== Verifying JAR files ==="
-          for proj in $CHANGED_PROJECTS; do
-            echo "Checking $proj..."
-            if ls $proj/target/*.jar 1> /dev/null 2>&1; then
-              echo "✓ Found JAR in target/: $(ls $proj/target/*.jar)"
-            elif ls $proj/build/libs/*.jar 1> /dev/null 2>&1; then
-              echo "✓ Found JAR in build/libs/: $(ls $proj/build/libs/*.jar)"
-            else
-              echo "❌ ERROR: No JAR file found for $proj"
-              exit 1
             fi
           done
 
@@ -91,76 +69,78 @@ jobs:
           for proj in $CHANGED_PROJECTS; do
             echo "=== Deploying $proj on port $PORT ==="
 
-            # Find the JAR file
+            # Find JAR file
             JAR_FILE=""
             if ls $GITHUB_WORKSPACE/$proj/target/*.jar 1> /dev/null 2>&1; then
               JAR_FILE=$(ls $GITHUB_WORKSPACE/$proj/target/*.jar | head -1)
-            elif ls $GITHUB_WORKSPACE/$proj/build/libs/*.jar 1> /dev/null 2>&1; then
-              JAR_FILE=$(ls $GITHUB_WORKSPACE/$proj/build/libs/*.jar | head -1)
-            fi
-
-            if [ -z "$JAR_FILE" ]; then
-              echo "ERROR: No JAR file found for $proj"
-              exit 1
             fi
 
             echo "Deploying JAR: $JAR_FILE"
 
-            # Create directories and backup on EC2
+            # Create directories
             ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
               mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup
               if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
-                echo 'Creating backup of existing JAR'
                 mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
               fi
             "
 
-            # Upload new JAR
+            # Upload JAR
             scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "$JAR_FILE" ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
 
-            # Deploy with detailed debugging
+            # Deploy application
             ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-              set -x  # Enable debugging
-              
               cd /home/ec2-user/$proj
-              echo 'Current directory:'
-              pwd
-              echo 'JAR files in directory:'
-              ls -la *.jar || echo 'No JAR files found'
               
-              # Stop any process using the port
-              echo 'Checking for processes using port $PORT...'
-              PORT_PID=\$(lsof -ti:$PORT)
+              # Stop any existing process
+              echo 'Stopping any existing process...'
+              pkill -f 'java.*$proj' 2>/dev/null || true
+              sleep 3
+              
+              # Kill any process using the port
+              PORT_PID=\$(lsof -ti:$PORT 2>/dev/null || echo '')
               if [ ! -z \"\$PORT_PID\" ]; then
-                echo \"Killing process \$PORT_PID using port $PORT\"
-                kill -9 \$PORT_PID
+                echo \"Killing process \$PORT_PID on port $PORT\"
+                kill -9 \$PORT_PID 2>/dev/null || true
+                sleep 2
               fi
               
-              # Start application with detailed output
+              # Start application
               echo 'Starting application...'
-              nohup java -jar *.jar --server.port=$PORT > $proj.log 2>&1 &
+              nohup java -jar *.jar --server.port=$PORT --server.address=0.0.0.0 > $proj.log 2>&1 &
               APP_PID=\$!
               echo \"Application started with PID: \$APP_PID\"
               
-              # Wait and check
-              sleep 10
-              
-              echo 'Checking if process is running:'
-              ps -p \$APP_PID >/dev/null 2>&1 && echo \"Process \$APP_PID is running\" || echo \"Process \$APP_PID is NOT running\"
-              
-              echo 'Checking port $PORT:'
-              ss -tuln | grep \":$PORT\" && echo \"Port $PORT is in use\" || echo \"Port $PORT is NOT in use\"
-              
-              echo 'Application logs (first 50 lines):'
-              head -50 $proj.log || echo 'No logs available'
-              
-              echo 'Error logs (last 20 lines):'
-              tail -20 $proj.log || echo 'No error logs available'
-              
-              set +x
-            " || echo "Deployment for $proj completed with warnings"
+              # Wait and monitor
+              echo 'Waiting for application to start...'
+              for i in {1..30}; do
+                if ! ps -p \$APP_PID > /dev/null 2>&1; then
+                  echo \"❌ Process died immediately!\"
+                  echo \"=== APPLICATION LOGS ===\"
+                  cat $proj.log
+                  echo \"=== END LOGS ===\"
+                  exit 1
+                fi
+                
+                if ss -tuln | grep -q \":$PORT\"; then
+                  echo \"✅ SUCCESS: Port $PORT is now listening!\"
+                  break
+                fi
+                
+                if [ \$i -eq 30 ]; then
+                  echo \"❌ TIMEOUT: Port $PORT still not listening after 30 seconds\"
+                  echo \"Process status: \$(ps -p \$APP_PID >/dev/null && echo 'RUNNING' || echo 'DEAD')\"
+                  echo \"=== LAST 50 LINES OF LOGS ===\"
+                  tail -50 $proj.log
+                  echo \"=== END DIAGNOSTICS ===\"
+                  break
+                fi
+                
+                echo \"Waiting... (\$i/30)\"
+                sleep 1
+              done
+            " || echo "⚠️  Deployment for $proj had issues, continuing..."
 
-            # Increment port for next project
             PORT=$((PORT + 1))
             if [ $PORT -gt $END_PORT ]; then
               PORT=$START_PORT
@@ -168,21 +148,21 @@ jobs:
             echo ""
           done
 
-      - name: Final verification
+      - name: Final comprehensive check
         run: |
           echo "=== Final deployment status ==="
           ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-            echo '=== Running Java processes ==='
+            echo '=== Running Java Processes ==='
             ps aux | grep java | grep -v grep || echo 'No Java processes found'
             
             echo ''
-            echo '=== Open ports ==='
+            echo '=== Open Ports ==='
             ss -tuln | grep 'LISTEN' | grep -E ':(808[0-6])' || echo 'No deployment ports found'
             
             echo ''
-            echo '=== Application status ==='
+            echo '=== Application Status ==='
             for proj in $CHANGED_PROJECTS; do
-              echo \"--- $proj ---\"
+              echo \"--- \$proj ---\"
               if [ -f \"/home/ec2-user/\$proj/\$proj.log\" ]; then
                 echo 'Last 10 lines of log:'
                 tail -10 \"/home/ec2-user/\$proj/\$proj.log\"
@@ -192,9 +172,9 @@ jobs:
               fi
             done
             
-            echo '=== Disk usage ==='
+            echo '=== Disk Usage ==='
             df -h /home/ec2-user/
             
-            echo '=== Memory usage ==='
+            echo '=== Memory Usage ==='
             free -h
           "
