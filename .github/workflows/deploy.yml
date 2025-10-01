@@ -1,4 +1,4 @@
-name: Test EC2 Deployment Setup
+name: Deploy JARs to EC2
 
 on:
   push:
@@ -6,10 +6,12 @@ on:
       - main
 
 jobs:
-  test-deploy:
+  deploy:
     runs-on: ubuntu-latest
     env:
       CHANGED_PROJECTS: "Clientes Inventarios modulo-jwt paquetes Servicios"
+      START_PORT: 8080
+      END_PORT: 8086
 
     steps:
       - name: Checkout code
@@ -40,7 +42,7 @@ jobs:
 
       - name: Test SSH connection
         run: |
-          ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "echo 'SSH connection OK'"
+          ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "echo 'SSH OK'"
 
       - name: Build projects
         run: |
@@ -55,9 +57,55 @@ jobs:
             cd ..
           done
 
-      - name: List generated JARs
+      - name: Verify JARs
         run: |
           for proj in $CHANGED_PROJECTS; do
-            echo "=== JARs for $proj ==="
-            ls -l $proj/target/*.jar || ls -l $proj/build/libs/*.jar || echo "No JAR found for $proj"
+            if ! ls $proj/target/*.jar 1> /dev/null 2>&1 && ! ls $proj/build/libs/*.jar 1> /dev/null 2>&1; then
+              echo "ERROR: $proj no compiló, abortando deploy."
+              exit 1
+            fi
+          done
+
+      - name: Deploy projects to EC2
+        run: |
+          PORT=$START_PORT
+          for proj in $CHANGED_PROJECTS; do
+            echo "=== Deploying $proj on port $PORT ==="
+
+            # Crear carpetas y backup en EC2
+            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
+              mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup
+              if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
+                mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
+              fi
+            "
+
+            # Subir JAR
+            if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
+              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
+            elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
+              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
+            fi
+
+            # Ejecutar despliegue en EC2 con rollback
+            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
+              pkill -f $proj || true
+              nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
+              sleep 10
+
+              if ! ss -tuln | grep -q \":$PORT\"; then
+                echo \"ERROR: $proj failed to start on port $PORT, rollback...\"
+                pkill -f $proj || true
+                if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
+                  mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
+                  nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
+                fi
+              fi
+            "
+
+            # Incrementar puerto para el siguiente proyecto
+            PORT=$((PORT+1))
+            if [ $PORT -gt $END_PORT ]; then
+              PORT=$START_PORT
+            fi
           done
