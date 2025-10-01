@@ -8,9 +8,8 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-   env:
-  CHANGED_PROJECTS: "Clientes Inventarios modulo-jwt paquetes Servicios"
-
+    env:
+      CHANGED_PROJECTS: "Clientes Inventarios modulo-jwt paquetes Servicios"  # reemplaza con tus proyectos separados por espacios
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
