@@ -38,6 +38,16 @@ jobs:
         run: |
           ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "echo 'SSH connection successful'"
 
+      - name: Verify Java on EC2
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
+            echo '=== Checking Java on EC2 ==='
+            java -version || echo 'Java not found'
+            which java || echo 'Java not in PATH'
+            echo 'Java home:'
+            ls -la /usr/lib/jvm/ || echo 'No JVM directory'
+          "
+
       - name: Build projects
         run: |
           for proj in $CHANGED_PROJECTS; do
@@ -69,8 +79,6 @@ jobs:
               echo "✓ Found JAR in build/libs/: $(ls $proj/build/libs/*.jar)"
             else
               echo "❌ ERROR: No JAR file found for $proj"
-              echo "Directory contents:"
-              find $proj -type f -name "*.jar" || echo "No JAR files found"
               exit 1
             fi
           done
@@ -98,7 +106,7 @@ jobs:
 
             echo "Deploying JAR: $JAR_FILE"
 
-            # Create backup on EC2
+            # Create directories and backup on EC2
             ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
               mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup
               if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
@@ -110,66 +118,46 @@ jobs:
             # Upload new JAR
             scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "$JAR_FILE" ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
 
-            # Deploy with health check and rollback - CORREGIDO
+            # Deploy with detailed debugging
             ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-              set +e  # Desactivar exit on error temporalmente
+              set -x  # Enable debugging
               
-              # Stop existing process - MÁS ROBUSTO
-              echo 'Stopping existing process...'
-              pkill -f \"java.*$proj\" 2>/dev/null
-              if [ \$? -eq 1 ]; then
-                echo 'No existing process found to stop'
-              fi
-              sleep 3
+              cd /home/ec2-user/$proj
+              echo 'Current directory:'
+              pwd
+              echo 'JAR files in directory:'
+              ls -la *.jar || echo 'No JAR files found'
               
-              # Kill any process using the port
-              PORT_PID=\$(ss -tulpn | grep \":$PORT\" | awk '{print \$7}' | cut -d= -f2 | cut -d, -f1 | head -1)
+              # Stop any process using the port
+              echo 'Checking for processes using port $PORT...'
+              PORT_PID=\$(lsof -ti:$PORT)
               if [ ! -z \"\$PORT_PID\" ]; then
                 echo \"Killing process \$PORT_PID using port $PORT\"
-                kill -9 \$PORT_PID 2>/dev/null || true
-                sleep 2
+                kill -9 \$PORT_PID
               fi
               
-              set -e  # Reactivar exit on error
-              
-              # Start new application
+              # Start application with detailed output
               echo 'Starting application...'
-              cd /home/ec2-user/$proj
               nohup java -jar *.jar --server.port=$PORT > $proj.log 2>&1 &
               APP_PID=\$!
-              echo \"Started with PID: \$APP_PID\"
+              echo \"Application started with PID: \$APP_PID\"
               
-              # Wait and check health
-              sleep 20
+              # Wait and check
+              sleep 10
               
-              if ss -tuln | grep -q \":$PORT\"; then
-                echo \"✅ $proj successfully started on port $PORT\"
-                echo \"Application logs (last 10 lines):\"
-                tail -10 $proj.log || echo 'No logs yet'
-              else
-                echo \"❌ $proj failed to start on port $PORT, performing rollback...\"
-                # Kill the failed process
-                kill \$APP_PID 2>/dev/null || true
-                sleep 3
-                
-                if ls backup/*.jar 1> /dev/null 2>&1; then
-                  echo 'Restoring backup...'
-                  rm -f *.jar
-                  mv backup/*.jar .
-                  nohup java -jar *.jar --server.port=$PORT > $proj.log 2>&1 &
-                  sleep 15
-                  
-                  if ss -tuln | grep -q \":$PORT\"; then
-                    echo \"✅ Rollback successful for $proj\"
-                  else
-                    echo \"❌ Rollback failed for $proj\"
-                    # Don't exit here, continue with next project
-                  fi
-                else
-                  echo 'No backup available for rollback'
-                  # Don't exit here, continue with next project
-                fi
-              fi
+              echo 'Checking if process is running:'
+              ps -p \$APP_PID >/dev/null 2>&1 && echo \"Process \$APP_PID is running\" || echo \"Process \$APP_PID is NOT running\"
+              
+              echo 'Checking port $PORT:'
+              ss -tuln | grep \":$PORT\" && echo \"Port $PORT is in use\" || echo \"Port $PORT is NOT in use\"
+              
+              echo 'Application logs (first 50 lines):'
+              head -50 $proj.log || echo 'No logs available'
+              
+              echo 'Error logs (last 20 lines):'
+              tail -20 $proj.log || echo 'No error logs available'
+              
+              set +x
             " || echo "Deployment for $proj completed with warnings"
 
             # Increment port for next project
@@ -180,21 +168,33 @@ jobs:
             echo ""
           done
 
-      - name: Verify deployments
+      - name: Final verification
         run: |
           echo "=== Final deployment status ==="
           ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-            echo 'Running Java processes:'
+            echo '=== Running Java processes ==='
             ps aux | grep java | grep -v grep || echo 'No Java processes found'
+            
             echo ''
-            echo 'Open ports:'
+            echo '=== Open ports ==='
             ss -tuln | grep 'LISTEN' | grep -E ':(808[0-6])' || echo 'No deployment ports found'
+            
             echo ''
-            echo 'Recent application logs:'
+            echo '=== Application status ==='
             for proj in $CHANGED_PROJECTS; do
+              echo \"--- $proj ---\"
               if [ -f \"/home/ec2-user/\$proj/\$proj.log\" ]; then
-                echo \"=== \$proj logs (last 5 lines) ===\"
-                tail -5 \"/home/ec2-user/\$proj/\$proj.log\" || echo 'No logs'
+                echo 'Last 10 lines of log:'
+                tail -10 \"/home/ec2-user/\$proj/\$proj.log\"
+                echo ''
+              else
+                echo 'No log file found'
               fi
             done
+            
+            echo '=== Disk usage ==='
+            df -h /home/ec2-user/
+            
+            echo '=== Memory usage ==='
+            free -h
           "
