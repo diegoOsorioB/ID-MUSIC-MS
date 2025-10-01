@@ -22,12 +22,7 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
-          cache: maven
-
-      - name: Configure Java environment
-        run: |
-          echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
-          echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
+          cache: 'maven'
 
       - name: Verify Java version
         run: java -version
@@ -38,74 +33,158 @@ jobs:
           echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.EC2_DNS }} >> ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
 
       - name: Test SSH connection
         run: |
-          ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "echo 'SSH OK'"
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "echo 'SSH connection successful'"
 
       - name: Build projects
         run: |
           for proj in $CHANGED_PROJECTS; do
             echo "=== Building $proj ==="
-            cd $proj
-            if [ -f "pom.xml" ]; then
-              mvn clean package -DskipTests -Dmaven.compiler.release=21
-            elif [ -f "build.gradle" ]; then
-              ./gradlew build -x test
+            if [ -d "$proj" ]; then
+              cd "$proj"
+              if [ -f "pom.xml" ]; then
+                mvn clean package -DskipTests
+              elif [ -f "build.gradle" ]; then
+                chmod +x ./gradlew
+                ./gradlew build -x test
+              else
+                echo "WARNING: No build file found for $proj"
+              fi
+              cd ..
+            else
+              echo "WARNING: Directory $proj not found"
             fi
-            cd ..
           done
 
-      - name: Verify JARs
+      - name: Verify JARs were built
         run: |
+          echo "=== Verifying JAR files ==="
           for proj in $CHANGED_PROJECTS; do
-            if ! ls $proj/target/*.jar 1> /dev/null 2>&1 && ! ls $proj/build/libs/*.jar 1> /dev/null 2>&1; then
-              echo "ERROR: $proj no compiló, abortando deploy."
+            echo "Checking $proj..."
+            if ls $proj/target/*.jar 1> /dev/null 2>&1; then
+              echo "✓ Found JAR in target/: $(ls $proj/target/*.jar)"
+            elif ls $proj/build/libs/*.jar 1> /dev/null 2>&1; then
+              echo "✓ Found JAR in build/libs/: $(ls $proj/build/libs/*.jar)"
+            else
+              echo "❌ ERROR: No JAR file found for $proj"
+              echo "Directory contents:"
+              find $proj -type f -name "*.jar" || echo "No JAR files found"
               exit 1
             fi
           done
 
+      - name: Prepare EC2 environment
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
+            # Verify Java is installed on EC2
+            java -version || echo 'Java not found, installing...'
+            
+            # Create directories for all projects
+            for proj in $CHANGED_PROJECTS; do
+              mkdir -p /home/ec2-user/\$proj /home/ec2-user/\$proj/backup
+              echo 'Created directories for' \$proj
+            done
+          "
+
       - name: Deploy projects to EC2
         run: |
+          set -e  # Exit on any error
           PORT=$START_PORT
+          
           for proj in $CHANGED_PROJECTS; do
             echo "=== Deploying $proj on port $PORT ==="
 
-            # Crear carpetas y backup en EC2
-            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-              mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup
+            # Find the JAR file
+            JAR_FILE=""
+            if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
+              JAR_FILE=$(ls $GITHUB_WORKSPACE/$proj/target/*.jar | head -1)
+            elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
+              JAR_FILE=$(ls $GITHUB_WORKSPACE/$proj/build/libs/*.jar | head -1)
+            fi
+
+            if [ -z "$JAR_FILE" ]; then
+              echo "ERROR: No JAR file found for $proj"
+              exit 1
+            fi
+
+            echo "Deploying JAR: $JAR_FILE"
+
+            # Create backup on EC2
+            ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
               if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
+                echo 'Creating backup of existing JAR'
                 mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
               fi
             "
 
-            # Subir JAR
-            if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
-              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
-            elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
-              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
-            fi
+            # Upload new JAR
+            scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "$JAR_FILE" ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
 
-            # Ejecutar despliegue en EC2 con rollback
-            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-              pkill -f $proj || true
-              nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
-              sleep 10
-
-              if ! ss -tuln | grep -q \":$PORT\"; then
-                echo \"ERROR: $proj failed to start on port $PORT, rollback...\"
-                pkill -f $proj || true
-                if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
-                  mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
-                  nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
+            # Deploy with health check and rollback
+            ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
+              set -e
+              cd /home/ec2-user/$proj
+              
+              # Stop existing process
+              echo 'Stopping existing process...'
+              pkill -f \"java.*$proj\" || true
+              sleep 2
+              
+              # Start new application
+              echo 'Starting application...'
+              nohup java -jar *.jar --server.port=$PORT > $proj.log 2>&1 &
+              APP_PID=\$!
+              echo \"Started with PID: \$APP_PID\"
+              
+              # Wait and check health
+              sleep 15
+              
+              if ss -tuln | grep -q \":$PORT\"; then
+                echo \"✅ $proj successfully started on port $PORT\"
+                echo \"Application logs:\"
+                tail -20 $proj.log || echo 'No logs yet'
+              else
+                echo \"❌ $proj failed to start on port $PORT, performing rollback...\"
+                kill \$APP_PID 2>/dev/null || true
+                sleep 2
+                
+                if ls backup/*.jar 1> /dev/null 2>&1; then
+                  echo 'Restoring backup...'
+                  rm -f *.jar
+                  mv backup/*.jar .
+                  nohup java -jar *.jar --server.port=$PORT > $proj.log 2>&1 &
+                  sleep 10
+                  
+                  if ss -tuln | grep -q \":$PORT\"; then
+                    echo \"✅ Rollback successful for $proj\"
+                  else
+                    echo \"❌ Rollback failed for $proj\"
+                    exit 1
+                  fi
+                else
+                  echo 'No backup available for rollback'
+                  exit 1
                 fi
               fi
             "
 
-            # Incrementar puerto para el siguiente proyecto
-            PORT=$((PORT+1))
+            # Increment port for next project
+            PORT=$((PORT + 1))
             if [ $PORT -gt $END_PORT ]; then
               PORT=$START_PORT
             fi
+            echo ""
           done
+
+      - name: Verify deployments
+        run: |
+          echo "=== Final deployment status ==="
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
+            echo 'Running processes:'
+            ps aux | grep java | grep -v grep || echo 'No Java processes found'
+            echo ''
+            echo 'Open ports:'
+            ss -tuln | grep 'LISTEN' | grep -E ':(808[0-6])' || echo 'No deployment ports found'
+          "
