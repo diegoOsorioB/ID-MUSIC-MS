@@ -31,10 +31,15 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.EC2_DNS }} >> ~/.ssh/known_hosts
 
-      - name: Disable EC2 Internal Firewall
+      - name: Test SSH connection
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "echo 'SSH connection successful'"
+
+      - name: Configure EC2 Environment
         run: |
           ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-            echo '=== Disabling internal firewall ==='
+            # Disable firewall
+            echo '=== Disabling firewall ==='
             sudo iptables -F 2>/dev/null || true
             sudo iptables -X 2>/dev/null || true
             sudo iptables -t nat -F 2>/dev/null || true
@@ -42,7 +47,18 @@ jobs:
             sudo iptables -P INPUT ACCEPT 2>/dev/null || true
             sudo iptables -P FORWARD ACCEPT 2>/dev/null || true
             sudo iptables -P OUTPUT ACCEPT 2>/dev/null || true
-            echo 'Firewall disabled'
+            
+            # Verify Java installation
+            echo '=== Java Version ==='
+            java -version || echo 'Java not found'
+            
+            # Create base directories
+            echo '=== Creating directories ==='
+            for proj in $CHANGED_PROJECTS; do
+              mkdir -p /home/ec2-user/\$proj /home/ec2-user/\$proj/backup
+            done
+            
+            echo 'EC2 environment configured'
           "
 
       - name: Build projects
@@ -58,6 +74,23 @@ jobs:
                 ./gradlew build -x test
               fi
               cd ..
+            else
+              echo "WARNING: Directory $proj not found"
+            fi
+          done
+
+      - name: Verify JARs were built
+        run: |
+          echo "=== Verifying JAR files ==="
+          for proj in $CHANGED_PROJECTS; do
+            echo "Checking $proj..."
+            if ls $proj/target/*.jar 1> /dev/null 2>&1; then
+              echo "✓ Found JAR in target/: $(ls $proj/target/*.jar)"
+            elif ls $proj/build/libs/*.jar 1> /dev/null 2>&1; then
+              echo "✓ Found JAR in build/libs/: $(ls $proj/build/libs/*.jar)"
+            else
+              echo "❌ ERROR: No JAR file found for $proj"
+              exit 1
             fi
           done
 
@@ -73,74 +106,88 @@ jobs:
             JAR_FILE=""
             if ls $GITHUB_WORKSPACE/$proj/target/*.jar 1> /dev/null 2>&1; then
               JAR_FILE=$(ls $GITHUB_WORKSPACE/$proj/target/*.jar | head -1)
+            elif ls $GITHUB_WORKSPACE/$proj/build/libs/*.jar 1> /dev/null 2>&1; then
+              JAR_FILE=$(ls $GITHUB_WORKSPACE/$proj/build/libs/*.jar | head -1)
+            fi
+
+            if [ -z "$JAR_FILE" ]; then
+              echo "ERROR: No JAR file found for $proj"
+              exit 1
             fi
 
             echo "Deploying JAR: $JAR_FILE"
 
-            # Create directories
+            # Create backup on EC2
             ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
               mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup
               if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
+                echo 'Creating backup of existing JAR'
                 mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
               fi
             "
 
-            # Upload JAR
+            # Upload new JAR
             scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "$JAR_FILE" ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
 
-            # Deploy application
+            # Deploy with health check
             ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
+              set -e
               cd /home/ec2-user/$proj
               
-              # Stop any existing process
-              echo 'Stopping any existing process...'
-              pkill -f 'java.*$proj' 2>/dev/null || true
-              sleep 3
+              # Stop existing process
+              echo 'Stopping existing process...'
+              pkill -f \"java.*$proj\" || true
+              sleep 2
               
               # Kill any process using the port
               PORT_PID=\$(lsof -ti:$PORT 2>/dev/null || echo '')
               if [ ! -z \"\$PORT_PID\" ]; then
-                echo \"Killing process \$PORT_PID on port $PORT\"
+                echo \"Killing process \$PORT_PID using port $PORT\"
                 kill -9 \$PORT_PID 2>/dev/null || true
                 sleep 2
               fi
               
-              # Start application
+              # Start new application
               echo 'Starting application...'
               nohup java -jar *.jar --server.port=$PORT --server.address=0.0.0.0 > $proj.log 2>&1 &
               APP_PID=\$!
-              echo \"Application started with PID: \$APP_PID\"
+              echo \"Started with PID: \$APP_PID\"
               
-              # Wait and monitor
-              echo 'Waiting for application to start...'
-              for i in {1..30}; do
-                if ! ps -p \$APP_PID > /dev/null 2>&1; then
-                  echo \"❌ Process died immediately!\"
-                  echo \"=== APPLICATION LOGS ===\"
+              # Wait and check health
+              sleep 20
+              
+              if ss -tuln | grep -q \":$PORT\"; then
+                echo \"✅ $proj successfully started on port $PORT\"
+                echo \"Application logs (last 5 lines):\"
+                tail -5 $proj.log || echo 'No logs yet'
+              else
+                echo \"❌ $proj failed to start on port $PORT, performing rollback...\"
+                kill \$APP_PID 2>/dev/null || true
+                sleep 2
+                
+                if ls backup/*.jar 1> /dev/null 2>&1; then
+                  echo 'Restoring backup...'
+                  rm -f *.jar
+                  mv backup/*.jar .
+                  nohup java -jar *.jar --server.port=$PORT --server.address=0.0.0.0 > $proj.log 2>&1 &
+                  sleep 15
+                  
+                  if ss -tuln | grep -q \":$PORT\"; then
+                    echo \"✅ Rollback successful for $proj\"
+                  else
+                    echo \"❌ Rollback failed for $proj\"
+                    echo \"Rollback logs:\"
+                    tail -20 $proj.log
+                  fi
+                else
+                  echo 'No backup available for rollback'
+                  echo \"Application logs:\"
                   cat $proj.log
-                  echo \"=== END LOGS ===\"
-                  exit 1
                 fi
-                
-                if ss -tuln | grep -q \":$PORT\"; then
-                  echo \"✅ SUCCESS: Port $PORT is now listening!\"
-                  break
-                fi
-                
-                if [ \$i -eq 30 ]; then
-                  echo \"❌ TIMEOUT: Port $PORT still not listening after 30 seconds\"
-                  echo \"Process status: \$(ps -p \$APP_PID >/dev/null && echo 'RUNNING' || echo 'DEAD')\"
-                  echo \"=== LAST 50 LINES OF LOGS ===\"
-                  tail -50 $proj.log
-                  echo \"=== END DIAGNOSTICS ===\"
-                  break
-                fi
-                
-                echo \"Waiting... (\$i/30)\"
-                sleep 1
-              done
-            " || echo "⚠️  Deployment for $proj had issues, continuing..."
+              fi
+            " || echo "Deployment for $proj completed with warnings"
 
+            # Increment port for next project
             PORT=$((PORT + 1))
             if [ $PORT -gt $END_PORT ]; then
               PORT=$START_PORT
@@ -148,7 +195,7 @@ jobs:
             echo ""
           done
 
-      - name: Final comprehensive check
+      - name: Final deployment verification
         run: |
           echo "=== Final deployment status ==="
           ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
@@ -172,9 +219,20 @@ jobs:
               fi
             done
             
-            echo '=== Disk Usage ==='
+            echo '=== System Resources ==='
+            echo 'Disk usage:'
             df -h /home/ec2-user/
-            
-            echo '=== Memory Usage ==='
+            echo ''
+            echo 'Memory usage:'
             free -h
+            echo ''
+            echo 'Current time:'
+            date
           "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "=== Cleanup ==="
+          rm -f ~/.ssh/id_rsa
+          echo "SSH key cleaned up"
