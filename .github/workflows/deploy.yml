@@ -41,8 +41,7 @@ jobs:
           chmod 644 ~/.ssh/known_hosts
 
       - name: Test SSH connection
-        run: |
-          ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "echo 'SSH OK'"
+        run: ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "echo 'SSH OK'"
 
       - name: Build projects
         run: |
@@ -61,7 +60,7 @@ jobs:
         run: |
           for proj in $CHANGED_PROJECTS; do
             if ! ls $proj/target/*.jar 1> /dev/null 2>&1 && ! ls $proj/build/libs/*.jar 1> /dev/null 2>&1; then
-              echo "ERROR: $proj no compiló, abortando deploy."
+              echo "ERROR: $proj did not build correctly, aborting deploy."
               exit 1
             fi
           done
@@ -73,7 +72,8 @@ jobs:
             echo "=== Deploying $proj on port $PORT ==="
 
             # Crear carpetas y backup en EC2
-            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} << EOF
+            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} bash -s -- "$proj" << 'EOF'
+proj="$1"
 mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup || true
 if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
   mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
@@ -88,13 +88,16 @@ EOF
             fi
 
             # Ejecutar despliegue en EC2 con rollback
-            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} << EOF
+            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} bash -s -- "$proj" "$PORT" << 'EOF'
+proj="$1"
+PORT="$2"
+
 pkill -f $proj || true
 nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
 sleep 10
 
 if ! ss -tuln | grep -q ":$PORT"; then
-  echo "ERROR: $proj failed to start on port $PORT, rollback..."
+  echo "ERROR: $proj failed to start on port $PORT, performing rollback..."
   pkill -f $proj || true
   if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
     mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
