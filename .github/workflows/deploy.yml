@@ -1,4 +1,4 @@
-name: Deploy JAR to EC2
+name: Advanced Deploy JAR to EC2
 
 on:
   push:
@@ -10,27 +10,31 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CHANGED_PROJECTS: "Clientes Inventarios modulo-jwt paquetes Servicios"
+      START_PORT: 8080
+      END_PORT: 8086
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Setup Java 21
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
       - name: Setup SSH
         run: |
-          # Crear carpeta .ssh
           mkdir -p ~/.ssh
-
-          # Crear la llave privada desde el secreto
           echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-
-          # Agregar el host EC2 al known_hosts
           ssh-keyscan -H ${{ secrets.EC2_DNS }} >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
       - name: Build projects
         run: |
           for proj in $CHANGED_PROJECTS; do
+            echo "=== Building $proj ==="
             cd $proj
             if [ -f "pom.xml" ]; then
               mvn clean package -DskipTests
@@ -42,8 +46,9 @@ jobs:
 
       - name: Deploy to EC2
         run: |
+          PORT=$START_PORT
           for proj in $CHANGED_PROJECTS; do
-            echo "=== Deploying $proj ==="
+            echo "=== Deploying $proj on port $PORT ==="
 
             # Crear carpetas y backup en EC2
             ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
@@ -53,7 +58,7 @@ jobs:
               fi
             "
 
-            # Subir nuevo JAR
+            # Subir JAR
             if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
               scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
             elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
@@ -62,31 +67,24 @@ jobs:
 
             # Ejecutar despliegue en EC2
             ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-              # Detener cualquier JAR anterior
               pkill -f $proj || true
-
-              # Lanzar nuevo JAR
-              nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
+              nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
               sleep 10
 
-              # Verificar puertos 8080-8086
-              PORT_OK=false
-              for port in {8080..8086}; do
-                if ss -tuln | grep -q \":\$port\"; then
-                  PORT_OK=true
-                  break
-                fi
-              done
-
-              if [ \"\$PORT_OK\" = false ]; then
-                echo \"ERROR: $proj no arrancó, rollback...\"
-                # Detener JAR fallido
+              # Verificar si el puerto asignado está activo
+              if ! ss -tuln | grep -q \":\$PORT\"; then
+                echo \"ERROR: $proj failed to start on port \$PORT, rollback...\"
                 pkill -f $proj || true
-                # Restaurar backup
                 if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
                   mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
-                  nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
+                  nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
                 fi
               fi
             "
+
+            # Incrementar puerto para el siguiente proyecto
+            PORT=$((PORT+1))
+            if [ $PORT -gt $END_PORT ]; then
+              PORT=$START_PORT
+            fi
           done
