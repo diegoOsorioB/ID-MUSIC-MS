@@ -22,6 +22,15 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
+          cache: maven
+
+      - name: Configure Java environment
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
+          echo "PATH=$JAVA_HOME/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Verify Java version
+        run: java -version
 
       - name: Setup SSH key
         run: |
@@ -41,11 +50,20 @@ jobs:
             echo "=== Building $proj ==="
             cd $proj
             if [ -f "pom.xml" ]; then
-              mvn clean package -DskipTests
+              mvn clean package -DskipTests -Dmaven.compiler.release=21
             elif [ -f "build.gradle" ]; then
               ./gradlew build -x test
             fi
             cd ..
+          done
+
+      - name: Verify JARs
+        run: |
+          for proj in $CHANGED_PROJECTS; do
+            if ! ls $proj/target/*.jar 1> /dev/null 2>&1 && ! ls $proj/build/libs/*.jar 1> /dev/null 2>&1; then
+              echo "ERROR: $proj no compiló, abortando deploy."
+              exit 1
+            fi
           done
 
       - name: Deploy projects to EC2
@@ -55,7 +73,7 @@ jobs:
             echo "=== Deploying $proj on port $PORT ==="
 
             # Crear carpetas y backup en EC2
-            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} << 'EOF'
+            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} << EOF
 mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup || true
 if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
   mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
