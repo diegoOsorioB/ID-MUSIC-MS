@@ -71,7 +71,7 @@ jobs:
               nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
               sleep 10
 
-              # Verificar si el puerto asignado está activo
+              # Verificar si el puerto está activo
               if ! ss -tuln | grep -q \":\$PORT\"; then
                 echo \"ERROR: $proj failed to start on port \$PORT, rollback...\"
                 pkill -f $proj || true
