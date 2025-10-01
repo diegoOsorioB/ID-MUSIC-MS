@@ -6,37 +6,50 @@ on:
       - main
 
 jobs:
-  build-deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repositorio
+      # Checkout del repo
+      - name: Repositorio
         uses: actions/checkout@v3
 
+      # Detectar proyectos modificados
       - name: Detectar proyectos modificados
         id: cambios
         run: |
-          echo "CHANGED_PROJECTS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | awk -F/ '{print $1}' | sort -u)" >> $GITHUB_ENV
+          CHANGED_PROJECTS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | awk -F/ '{print $1}' | sort -u)
+          echo "CHANGED_PROJECTS=$CHANGED_PROJECTS" >> $GITHUB_ENV
           echo "Proyectos cambiados: $CHANGED_PROJECTS"
 
-      - name: Compilar proyectos modificados
+      # Compilar proyectos
+      - name: Compilar proyectos
         run: |
           for proj in $CHANGED_PROJECTS; do
-            echo "== Compilando $proj =="
+            echo "=== Compilando $proj ==="
             if [ -f "$proj/pom.xml" ]; then
-              mvn -f $proj/pom.xml -B clean package -DskipTests
+              mvn -f $proj/pom.xml clean package -DskipTests
             elif [ -f "$proj/build.gradle" ]; then
-              cd $proj && ./gradlew build -x test && cd ..
+              ./gradlew :$proj:build -x test
             else
-              echo "No se detectó build system en $proj"
+              echo "No se encontró build file para $proj"
             fi
           done
 
+      # Verificar que se generaron los JARs
+      - name: Verificar JARs
+        run: |
+          for proj in $CHANGED_PROJECTS; do
+            echo "JARs para $proj:"
+            ls -l $proj/target/*.jar 2>/dev/null || ls -l $proj/build/libs/*.jar 2>/dev/null || echo "No se encontró JAR"
+          done
+
+      # Deploy a EC2
       - name: Build y deploy por proyecto
         uses: appleboy/ssh-action@v0.1.6
         with:
           host: ${{ secrets.EC2_DNS }}
-          username: ec2-user
+          username: EC2-user
           key: ${{ secrets.EC2_KEY }}
           port: 22
           script: |
@@ -50,7 +63,7 @@ jobs:
                 mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
               fi
 
-              # Subir nuevo JAR (Maven o Gradle)
+              # Subir nuevo JAR
               if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
                 scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
               elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
@@ -81,3 +94,11 @@ jobs:
                 fi
               fi
             done
+
+      # Notificar Slack (opcional)
+      - name: Notificar Slack
+        if: success() && env.SLACK_WEBHOOK
+        uses: rtCamp/action-slack-notify@v2
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          message: "Deploy finalizado con éxito en EC2: ${{ github.repository }}"
