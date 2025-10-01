@@ -17,10 +17,15 @@ jobs:
 
       - name: Setup SSH
         run: |
+          # Crear carpeta .ssh
           mkdir -p ~/.ssh
+
+          # Crear la llave privada desde el secreto
           echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+          # Agregar el host EC2 al known_hosts
+          ssh-keyscan -H ${{ secrets.EC2_DNS }} >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
       - name: Build projects
@@ -40,8 +45,8 @@ jobs:
           for proj in $CHANGED_PROJECTS; do
             echo "=== Deploying $proj ==="
 
-            # Crear carpetas y backup
-            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_HOST }} "
+            # Crear carpetas y backup en EC2
+            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
               mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup
               if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
                 mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
@@ -50,13 +55,13 @@ jobs:
 
             # Subir nuevo JAR
             if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
-              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/$proj/
+              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
             elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
-              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/$proj/
+              scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
             fi
 
             # Ejecutar despliegue en EC2
-            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_HOST }} "
+            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
               # Detener cualquier JAR anterior
               pkill -f $proj || true
 
