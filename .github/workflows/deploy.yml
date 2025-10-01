@@ -1,4 +1,4 @@
-name: Deploy Proyectos Monorepo
+name: Despliegue a EC2
 
 on:
   push:
@@ -6,99 +6,42 @@ on:
       - main
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
 
+    env:
+      CHANGED_PROJECTS: "tu_proyecto"
+
     steps:
-      # Checkout del repo
-      - name: Repositorio
-        uses: actions/checkout@v3
+    - name: Checkout
+      uses: actions/checkout@v3
 
-      # Detectar proyectos modificados
-      - name: Detectar proyectos modificados
-        id: cambios
-        run: |
-          CHANGED_PROJECTS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | awk -F/ '{print $1}' | sort -u)
-          echo "CHANGED_PROJECTS=$CHANGED_PROJECTS" >> $GITHUB_ENV
-          echo "Proyectos cambiados: $CHANGED_PROJECTS"
+    - name: Configurar llave SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+        chmod 644 ~/.ssh/known_hosts
 
-      # Compilar proyectos
-      - name: Compilar proyectos
-        run: |
-          for proj in $CHANGED_PROJECTS; do
-            echo "=== Compilando $proj ==="
-            if [ -f "$proj/pom.xml" ]; then
-              mvn -f $proj/pom.xml clean package -DskipTests
-            elif [ -f "$proj/build.gradle" ]; then
-              ./gradlew :$proj:build -x test
-            else
-              echo "No se encontró build file para $proj"
+    - name: Test conexión SSH
+      run: ssh -i ~/.ssh/id_rsa ec2-user@${{ secrets.EC2_HOST }} -p 22 "echo Conexión exitosa"
+
+    - name: Desplegar proyecto
+      run: |
+        for proj in $CHANGED_PROJECTS; do
+          echo "=== Desplegando $proj ==="
+          ssh -i ~/.ssh/id_rsa ec2-user@${{ secrets.EC2_HOST }} -p 22 "
+            mkdir -p /home/ec2-user/$proj
+            mkdir -p /home/ec2-user/$proj/backup
+            if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
+              mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
             fi
-          done
-
-      # Verificar que se generaron los JARs
-      - name: Verificar JARs
-        run: |
-          for proj in $CHANGED_PROJECTS; do
-            echo "JARs para $proj:"
-            ls -l $proj/target/*.jar 2>/dev/null || ls -l $proj/build/libs/*.jar 2>/dev/null || echo "No se encontró JAR"
-          done
-
-      # Deploy a EC2
-      - name: Build y deploy por proyecto
-        uses: appleboy/ssh-action@v0.1.6
-        with:
-          host: ${{ secrets.EC2_DNS }}
-          username: EC2-user
-          key: ${{ secrets.EC2_KEY }}
-          port: 22
-          script: |
-            for proj in $CHANGED_PROJECTS; do
-              echo "=== Desplegando $proj ==="
-              mkdir -p /home/ec2-user/$proj
-              mkdir -p /home/ec2-user/$proj/backup
-
-              # Backup del JAR actual
-              if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
-                mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
-              fi
-
-              # Subir nuevo JAR
-              if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
-                scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
-              elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
-                scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
-              fi
-
-              # Detener app anterior
-              pkill -f "$proj" || true
-
-              # Lanzar nuevo JAR
-              nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
-              sleep 10
-
-              # Verificar puertos 8080-8086
-              PORT_OK=false
-              for port in {8080..8086}; do
-                if ss -tuln | grep -q ":$port"; then
-                  PORT_OK=true
-                  break
-                fi
-              done
-
-              if [ "$PORT_OK" = false ]; then
-                echo "ERROR: $proj no arrancó en puertos 8080-8086, haciendo rollback..."
-                if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
-                  mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
-                  nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
-                fi
-              fi
-            done
-
-      # Notificar Slack (opcional)
-      - name: Notificar Slack
-        if: success() && env.SLACK_WEBHOOK
-        uses: rtCamp/action-slack-notify@v2
-        with:
-          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
-          message: "Deploy finalizado con éxito en EC2: ${{ github.repository }}"
+          "
+          scp -i ~/.ssh/id_rsa -P 22 $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/$proj/
+          ssh -i ~/.ssh/id_rsa ec2-user@${{ secrets.EC2_HOST }} -p 22 "
+            pkill -f '$proj' || true
+            nohup java -jar /home/ec2-user/$proj/*.jar > /home/ec2-user/$proj/$proj.log 2>&1 &
+            sleep 10
+          "
+        done
