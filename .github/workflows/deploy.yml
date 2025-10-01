@@ -6,18 +6,31 @@ on:
       - main
 
 jobs:
-  build-and-deploy:
+  build-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repositorio
         uses: actions/checkout@v3
 
       - name: Detectar proyectos modificados
-        id: changes
+        id: cambios
         run: |
           echo "CHANGED_PROJECTS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | awk -F/ '{print $1}' | sort -u)" >> $GITHUB_ENV
           echo "Proyectos cambiados: $CHANGED_PROJECTS"
+
+      - name: Compilar proyectos modificados
+        run: |
+          for proj in $CHANGED_PROJECTS; do
+            echo "== Compilando $proj =="
+            if [ -f "$proj/pom.xml" ]; then
+              mvn -f $proj/pom.xml -B clean package -DskipTests
+            elif [ -f "$proj/build.gradle" ]; then
+              cd $proj && ./gradlew build -x test && cd ..
+            else
+              echo "No se detectó build system en $proj"
+            fi
+          done
 
       - name: Build y deploy por proyecto
         uses: appleboy/ssh-action@v0.1.6
@@ -37,7 +50,7 @@ jobs:
                 mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
               fi
 
-              # Subir nuevo JAR
+              # Subir nuevo JAR (Maven o Gradle)
               if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
                 scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/target/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
               elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
@@ -68,10 +81,3 @@ jobs:
                 fi
               fi
             done
-
-      - name: Notificar Slack (opcional)
-        if: success() && env.SLACK_WEBHOOK
-        uses: rtCamp/action-slack-notify@v2
-        with:
-          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
-          message: "Deploy finalizado con éxito en EC2: ${{ github.repository }}"
