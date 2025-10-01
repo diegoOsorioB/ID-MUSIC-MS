@@ -55,7 +55,7 @@ jobs:
             echo "=== Deploying $proj on port $PORT ==="
 
             # Crear carpetas y backup en EC2
-            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} << EOF
+            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} << 'EOF'
 mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup || true
 if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
   mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
