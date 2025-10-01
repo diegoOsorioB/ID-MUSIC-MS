@@ -23,13 +23,17 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Setup SSH
+      - name: Setup SSH key
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.EC2_DNS }} >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
+
+      - name: Test SSH connection
+        run: |
+          ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "echo 'SSH OK'"
 
       - name: Build projects
         run: |
@@ -51,12 +55,12 @@ jobs:
             echo "=== Deploying $proj on port $PORT ==="
 
             # Crear carpetas y backup en EC2
-            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-              mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup
-              if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
-                mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
-              fi
-            "
+            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} << EOF
+mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup || true
+if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
+  mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
+fi
+EOF
 
             # Subir JAR
             if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
@@ -65,22 +69,21 @@ jobs:
               scp -o StrictHostKeyChecking=no $GITHUB_WORKSPACE/$proj/build/libs/*.jar ec2-user@${{ secrets.EC2_DNS }}:/home/ec2-user/$proj/
             fi
 
-            # Ejecutar despliegue en EC2
-            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-              pkill -f $proj || true
-              nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
-              sleep 10
+            # Ejecutar despliegue en EC2 con rollback
+            ssh -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} << EOF
+pkill -f $proj || true
+nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
+sleep 10
 
-              # Verificar si el puerto está activo
-              if ! ss -tuln | grep -q \":\$PORT\"; then
-                echo \"ERROR: $proj failed to start on port \$PORT, rollback...\"
-                pkill -f $proj || true
-                if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
-                  mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
-                  nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
-                fi
-              fi
-            "
+if ! ss -tuln | grep -q ":$PORT"; then
+  echo "ERROR: $proj failed to start on port $PORT, rollback..."
+  pkill -f $proj || true
+  if ls /home/ec2-user/$proj/backup/*.jar 1> /dev/null 2>&1; then
+    mv /home/ec2-user/$proj/backup/*.jar /home/ec2-user/$proj/
+    nohup java -jar /home/ec2-user/$proj/*.jar --server.port=$PORT > /home/ec2-user/$proj/$proj.log 2>&1 &
+  fi
+fi
+EOF
 
             # Incrementar puerto para el siguiente proyecto
             PORT=$((PORT+1))
