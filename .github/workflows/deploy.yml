@@ -44,7 +44,7 @@ jobs:
             cd ..
           done
 
-      - name: Deploy to EC2
+      - name: Deploy projects to EC2
         run: |
           PORT=$START_PORT
           for proj in $CHANGED_PROJECTS; do
@@ -87,4 +87,5 @@ jobs:
             if [ $PORT -gt $END_PORT ]; then
               PORT=$START_PORT
             fi
+
           done
