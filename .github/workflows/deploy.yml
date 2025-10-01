@@ -75,22 +75,9 @@ jobs:
             fi
           done
 
-      - name: Prepare EC2 environment
-        run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
-            # Verify Java is installed on EC2
-            java -version || echo 'Java not found, installing...'
-            
-            # Create directories for all projects
-            for proj in $CHANGED_PROJECTS; do
-              mkdir -p /home/ec2-user/\$proj /home/ec2-user/\$proj/backup
-              echo 'Created directories for' \$proj
-            done
-          "
-
       - name: Deploy projects to EC2
         run: |
-          set -e  # Exit on any error
+          set -e
           PORT=$START_PORT
           
           for proj in $CHANGED_PROJECTS; do
@@ -98,9 +85,9 @@ jobs:
 
             # Find the JAR file
             JAR_FILE=""
-            if [ -f $GITHUB_WORKSPACE/$proj/target/*.jar ]; then
+            if ls $GITHUB_WORKSPACE/$proj/target/*.jar 1> /dev/null 2>&1; then
               JAR_FILE=$(ls $GITHUB_WORKSPACE/$proj/target/*.jar | head -1)
-            elif [ -f $GITHUB_WORKSPACE/$proj/build/libs/*.jar ]; then
+            elif ls $GITHUB_WORKSPACE/$proj/build/libs/*.jar 1> /dev/null 2>&1; then
               JAR_FILE=$(ls $GITHUB_WORKSPACE/$proj/build/libs/*.jar | head -1)
             fi
 
@@ -113,6 +100,7 @@ jobs:
 
             # Create backup on EC2
             ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ec2-user@${{ secrets.EC2_DNS }} "
+              mkdir -p /home/ec2-user/$proj /home/ec2-user/$proj/backup
               if ls /home/ec2-user/$proj/*.jar 1> /dev/null 2>&1; then
                 echo 'Creating backup of existing JAR'
                 mv /home/ec2-user/$proj/*.jar /home/ec2-user/$proj/backup/
