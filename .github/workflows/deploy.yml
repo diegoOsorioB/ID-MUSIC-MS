@@ -1,4 +1,4 @@
-name: Advanced Deploy JAR to EC2
+name: Deploy JARs to EC2
 
 on:
   push:
